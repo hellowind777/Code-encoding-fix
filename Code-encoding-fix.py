@@ -16,6 +16,8 @@ from pathlib import Path
 from tkinter import filedialog, scrolledtext, ttk
 import json
 from typing import Callable
+from itertools import chain
+import time
 
 try:
     import winreg  # type: ignore
@@ -76,12 +78,15 @@ class SetupApp:
         self._detect_cache_max = 64
         self._shell_marker_detail = {}
         self._tool_config_detail = {}
+        self._registry_cache: dict[tuple[str, ...], list[Path]] = {}
+        self._shortcut_cache: dict[tuple[str, ...], list[Path]] = {}
+        self._detecting = False
 
         self._build_layout()
         self._apply_window_position()
         # 先记录应用启动，再进行 Shell 路径检测，保证日志顺序符合直觉
         self._log("应用已启动，准备检测 Shell 路径", "info")
-        self._detect_all_paths(log=True)
+        self._detect_all_paths_in_thread(log=True)
         self._refresh_env_tool_labels()
         self._update_restore_button_state()
         self._refresh_start_button_state()
@@ -245,14 +250,12 @@ class SetupApp:
         row_idx = self._build_shell_row(
             parent=path_frame,
             key="vscode",
-            label_text="Visual Studio Code settings",
+            label_text="Visual Studio Code",
             var=self.vscode_path_var,
             open_cmd=lambda: self._open_path("vscode"),
             start_row=row_idx,
             readonly=True,
         )
-        # Visual Studio Code 状态提示
-        self._row_widgets["vscode"]["status_full"].config(textvariable=self.tool_info_var)
 
         console_frame = ttk.LabelFrame(self.root, text="控制台配置", padding="8")
         console_frame.pack(fill="x", padx=12, pady=(2, 4))
@@ -263,7 +266,7 @@ class SetupApp:
         status_frame.pack(fill="x", padx=0, pady=(0, 4))
         self.admin_label = ttk.Label(status_frame, textvariable=self.status_var, foreground="#0063b1")
         self.admin_label.pack(side="left", anchor="w")
-        ttk.Button(status_frame, text="重新检测", command=self._detect_all_paths).pack(side="right")
+        ttk.Button(status_frame, text="重新检测", command=lambda: self._detect_all_paths_in_thread(log=True)).pack(side="right")
 
         progress_frame = ttk.Frame(self.root, padding="12 2 12 0")
         progress_frame.pack(fill="x")
@@ -1479,8 +1482,32 @@ class SetupApp:
         state = "normal" if enabled else "disabled"
         self.restore_btn.config(state=state)
 
+    # --------- 检测调度 ---------
+    def _detect_all_paths_in_thread(self, log: bool = True) -> None:
+        """后台线程执行检测，避免启动/重新检测阻塞 UI。"""
+        if self.is_running or getattr(self, "_detecting", False):
+            return
+        self._detecting = True
+        self.status_var.set("正在检测工具与编码状态...")
+        self._set_buttons_state(False)
+        threading.Thread(
+            target=self._run_detect_all_paths_safe, args=(log,), daemon=True
+        ).start()
+
+    def _run_detect_all_paths_safe(self, log: bool) -> None:
+        try:
+            self._detect_all_paths(log=log)
+        finally:
+            self._ui_call(self._on_detect_done)
+
+    def _on_detect_done(self) -> None:
+        self._detecting = False
+        self._set_buttons_state(True)
+        self._refresh_start_button_state()
+
     def _detect_all_paths(self, log: bool = True) -> None:
         # 如果上一条日志是检测分隔线，先清理本次检测段落，避免重复追加
+        t0 = time.perf_counter()
         if log:
             self._trim_last_detection_block()
             self._log_separator("检测开始")
@@ -1492,6 +1519,7 @@ class SetupApp:
             # 在检测块中输出“哪些内容被手动更改”的差异提示
             self._log_config_drift_report()
         if log:
+            self._log(f"检测耗时 {time.perf_counter() - t0:.2f}s", "info")
             self._log_separator("检测结束")
         # 先刷新编码/环境，再基于结果刷新汇总与按钮状态
         self._update_console_state_label()
@@ -1501,8 +1529,18 @@ class SetupApp:
         self._refresh_reset_default_button_state()
 
     def _detect_ps5(self, log: bool = True) -> None:
-        sys_root = os.environ.get("SystemRoot", r"C:\Windows")
-        candidate = Path(sys_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+        candidate = None
+        which_ps = shutil.which("powershell")
+        if which_ps:
+            candidate = Path(which_ps).resolve()
+        if candidate is None:
+            sys_root = os.environ.get("SystemRoot", r"C:\Windows")
+            candidate = Path(sys_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+        if candidate is None or not candidate.exists():
+            for target in self._shortcut_targets(["**/Windows PowerShell*.lnk"]):
+                if target.exists():
+                    candidate = target
+                    break
         if candidate.exists():
             self._ps5_exe = candidate
             self._ps5_available = True
@@ -1527,14 +1565,36 @@ class SetupApp:
                 self._log("未检测到 Windows PowerShell 5.1", "warning")
 
     def _detect_ps7(self, log: bool = True) -> None:
-        pf = os.environ.get("ProgramFiles", r"C:\Program Files")
-        candidates = sorted(Path(pf).glob("PowerShell/*/pwsh.exe"), reverse=True)
         path = None
-        for c in candidates:
-            if c.exists():
-                path = c
-                break
-        if path:
+        which_pwsh = shutil.which("pwsh")
+        if which_pwsh:
+            path = Path(which_pwsh).resolve()
+        else:
+            pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+            pf86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+            pf64 = os.environ.get("ProgramW6432", pf)
+            search_roots = [pf, pf86, pf64]
+            candidates: list[Path] = []
+            for root in search_roots:
+                if not root:
+                    continue
+                candidates.extend(sorted(Path(root).glob("PowerShell/*/pwsh.exe"), reverse=True))
+            for c in candidates:
+                if c.exists():
+                    path = c
+                    break
+        if path is None:
+            for loc in self._registry_install_locations(["powershell 7"]):
+                candidate = Path(loc) / "pwsh.exe"
+                if candidate.exists():
+                    path = candidate
+                    break
+        if path is None:
+            for target in self._shortcut_targets(["**/PowerShell 7*.lnk"]):
+                if target.exists():
+                    path = target
+                    break
+        if path and path.exists():
             self._ps7_exe = path
             self._ps7_available = True
             profile_exists = self._ps7_profile_path.exists()
@@ -1768,37 +1828,195 @@ class SetupApp:
             self.log_text.insert("end", new_content + "\n")
         self.log_text.configure(state="disabled")
 
+    # --------- 通用候选路径收集工具 ---------
+    def _registry_install_locations(self, keywords: list[str]) -> list[Path]:
+        """从卸载注册表读取 InstallLocation，关键词大小写不敏感。"""
+        key_tuple = tuple(sorted(k.lower() for k in keywords))
+        if key_tuple in self._registry_cache:
+            return list(self._registry_cache[key_tuple])
+        if winreg is None:
+            return []
+        locations: list[Path] = []
+        hives = [
+            (winreg.HKEY_LOCAL_MACHINE, "HKLM"),
+            (winreg.HKEY_CURRENT_USER, "HKCU"),
+        ]
+        views = [0]
+        if hasattr(winreg, "KEY_WOW64_64KEY"):
+            views = [winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY]
+        for hive, _ in hives:
+            for view in views:
+                try:
+                    key = winreg.OpenKey(
+                        hive,
+                        r"Software\Microsoft\Windows\CurrentVersion\Uninstall",
+                        0,
+                        winreg.KEY_READ | view,
+                    )
+                except OSError:
+                    continue
+                try:
+                    i = 0
+                    while True:
+                        try:
+                            subkey_name = winreg.EnumKey(key, i)
+                        except OSError:
+                            break
+                        i += 1
+                        try:
+                            subkey = winreg.OpenKey(key, subkey_name)
+                            display_name, _ = winreg.QueryValueEx(subkey, "DisplayName")
+                        except OSError:
+                            continue
+                        name_lower = str(display_name).lower()
+                        if not any(k.lower() in name_lower for k in keywords):
+                            continue
+                        try:
+                            loc, _ = winreg.QueryValueEx(subkey, "InstallLocation")
+                        except OSError:
+                            loc = ""
+                        if loc:
+                            p = Path(loc).expanduser()
+                            if p.exists():
+                                locations.append(p)
+                finally:
+                    try:
+                        winreg.CloseKey(key)
+                    except Exception:
+                        pass
+        seen = set()
+        uniq: list[Path] = []
+        for loc in locations:
+            if loc not in seen:
+                seen.add(loc)
+                uniq.append(loc)
+        self._registry_cache[key_tuple] = uniq
+        return uniq
+
+    def _shortcut_targets(self, patterns: list[str]) -> list[Path]:
+        """解析开始菜单快捷方式目标路径（最佳努力，依赖 PowerShell COM）。"""
+        pat_tuple = tuple(sorted(patterns))
+        if pat_tuple in self._shortcut_cache:
+            return list(self._shortcut_cache[pat_tuple])
+        start_roots = [
+            Path(os.environ.get("ProgramData", r"C:\ProgramData"))
+            / "Microsoft"
+            / "Windows"
+            / "Start Menu"
+            / "Programs",
+            Path(os.environ.get("APPDATA", Path.home()))
+            / "Microsoft"
+            / "Windows"
+            / "Start Menu"
+            / "Programs",
+        ]
+        pwsh = shutil.which("powershell") or shutil.which("pwsh")
+        if not pwsh:
+            return []
+
+        existing_roots = [str(r) for r in start_roots if r.exists()]
+        if not existing_roots:
+            self._shortcut_cache[pat_tuple] = []
+            return []
+
+        # 使用单次 PowerShell 批量解析，减少进程开销
+        pattern_clause = " -or ".join([f"($_.Name -like '{p}')" for p in patterns])
+        roots_literal = ",".join([f"'{r}'" for r in existing_roots])
+        ps_script = ";".join(
+            [
+                "$ErrorActionPreference='SilentlyContinue'",
+                f"$roots=@({roots_literal})",
+                "$ws=New-Object -ComObject WScript.Shell",
+                "$res=@()",
+                "foreach($r in $roots){",
+                " if(Test-Path $r){",
+                "   Get-ChildItem -LiteralPath $r -Filter *.lnk -Recurse | Where-Object {"
+                f" {pattern_clause} }} | ForEach-Object {{"
+                "     $s=$ws.CreateShortcut($_.FullName);"
+                "     if($s -and $s.TargetPath){ $res += $s.TargetPath }"
+                "   }",
+                " }",
+                "}",
+                "$res | Sort-Object -Unique",
+            ]
+        )
+        targets: list[Path] = []
+        try:
+            proc = subprocess.run(
+                [pwsh, "-NoProfile", "-Command", ps_script],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if proc.stdout:
+                for line in proc.stdout.splitlines():
+                    p = Path(line.strip()).expanduser()
+                    if p.exists():
+                        targets.append(p.resolve())
+        except Exception:
+            pass
+
+        seen = set()
+        uniq: list[Path] = []
+        for t in targets:
+            if t not in seen:
+                seen.add(t)
+                uniq.append(t)
+        self._shortcut_cache[pat_tuple] = uniq
+        return uniq
+
     def _detect_git_paths(self, log: bool = True) -> None:
-        candidates = []
+        primary_paths: list[Path] = []
         env_paths = [
             os.environ.get("ProgramFiles"),
             os.environ.get("ProgramFiles(x86)"),
+            os.environ.get("ProgramW6432"),
             os.environ.get("USERPROFILE"),
         ]
         for base in env_paths:
             if not base:
                 continue
-            p = Path(base) / "Git"
-            candidates.append(p)
-            local = Path(base) / "AppData" / "Local" / "Programs" / "Git"
-            candidates.append(local)
-        candidates.append(Path("D:/Programs/Git"))
+            base_path = Path(base)
+            primary_paths.append(base_path / "Git")
+            primary_paths.append(base_path / "AppData" / "Local" / "Programs" / "Git")
 
         bash_in_path = shutil.which("bash")
         if bash_in_path:
-            candidates.append(Path(bash_in_path).resolve().parents[1])
+            primary_paths.append(Path(bash_in_path).resolve().parents[1])
+        git_in_path = shutil.which("git")
+        if git_in_path:
+            git_root = Path(git_in_path).resolve().parent.parent
+            primary_paths.append(git_root)
 
-        unique_paths = []
-        for path in candidates:
-            if path and path not in unique_paths:
-                unique_paths.append(path)
+        program_data = os.environ.get("ProgramData", r"C:\ProgramData")
+        secondary_paths = [
+            Path(program_data) / "chocolatey" / "lib" / "git" / "tools",
+            Path.home() / "scoop" / "apps" / "git" / "current",
+            Path("D:/Programs/Git"),
+            Path.home() / "AppData" / "Local" / "Programs" / "Git",
+        ]
 
-        found = None
-        for path in unique_paths:
+        found: Path | None = None
+        for path in primary_paths:
             bash = path / "bin" / "bash.exe"
             if bash.exists():
                 found = bash
                 break
+
+        if not found:
+            # 仅在快速路径未命中时再做重扫描（注册表/快捷方式），避免启动慢
+            for loc in self._registry_install_locations(["git for windows", "git version", "git"]):
+                secondary_paths.append(loc)
+            for target in self._shortcut_targets(["Git Bash*.lnk", "Git*.lnk"]):
+                if target.name.lower().startswith("git-bash") or target.name.lower() == "bash.exe":
+                    secondary_paths.append(target.parent.parent)
+                else:
+                    secondary_paths.append(target.parent)
+            for path in secondary_paths:
+                bash = path / "bin" / "bash.exe"
+                if bash.exists():
+                    found = bash
+                    break
 
         if found:
             self._git_exe = found
@@ -1828,6 +2046,27 @@ class SetupApp:
         settings_path = Path(appdata) / "Code" / "User" / "settings.json" if appdata else None
         exe_path = shutil.which("code") or shutil.which("code.cmd")
         exe_resolved = Path(exe_path).resolve() if exe_path else None
+        if not exe_resolved:
+            local_app = os.environ.get("LOCALAPPDATA")
+            candidates = []
+            if local_app:
+                candidates.append(Path(local_app) / "Programs" / "Microsoft VS Code" / "Code.exe")
+            program_files = [
+                os.environ.get("ProgramFiles"),
+                os.environ.get("ProgramFiles(x86)"),
+                os.environ.get("ProgramW6432"),
+            ]
+            for root in program_files:
+                if root:
+                    candidates.append(Path(root) / "Microsoft VS Code" / "Code.exe")
+            for loc in self._registry_install_locations(["visual studio code", "microsoft visual studio code"]):
+                candidates.append(Path(loc) / "Code.exe")
+            for target in self._shortcut_targets(["**/Visual Studio Code*.lnk"]):
+                candidates.append(target)
+            for c in candidates:
+                if c and c.exists():
+                    exe_resolved = c.resolve()
+                    break
         self._vscode_available = bool(exe_resolved)
         display_exe = None
         if exe_resolved:
