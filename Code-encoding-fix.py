@@ -30,11 +30,17 @@ PROFILE_MARKER_END = "# === Code-encoding-fix 配置（自动生成）结束 ===
 BASH_MARKER_START = "# === Code-encoding-fix 配置（自动生成）开始 ==="
 BASH_MARKER_END = "# === Code-encoding-fix 配置（自动生成）结束 ==="
 
+# VS Code settings.json 注释使用 //，保持与其他工具一致的中文标记；同时兼容旧版英文标记
+VSCODE_MARKER_START = "// === Code-encoding-fix 配置（自动生成）开始 ==="
+VSCODE_MARKER_END = "// === Code-encoding-fix 配置（自动生成）结束 ==="
+VSCODE_MARKER_START_LEGACY = "// Code-encoding-fix block (do not remove)"
+VSCODE_MARKER_END_LEGACY = "// Code-encoding-fix block end"
+
 
 class SetupApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("Code-encoding-fix 编码配置助手 v1.0 - 阿華(github:hellowind777)")
+        self.root.title("Code-encoding-fix 编码配置助手 v1.0.2 - 阿華(github:hellowind777)")
         self._apply_app_icon()
         # 默认窗口尺寸与最小尺寸同步下调，保持宽度不变、降低高度以更贴合 1080p 显示
         self.root.geometry("820x750")
@@ -113,7 +119,7 @@ class SetupApp:
         if self.is_running:
             return
         confirm = self._show_modal(
-            "恢复系统默认(不含工具)",
+            "恢复系统默认编码(控制台配置)",
             "将删除控制台编码恢复到当前系统语言默认编码(936)，不再改写环境变量。\n\n是否继续？",
             kind="confirm",
             confirm_text="继续",
@@ -135,8 +141,7 @@ class SetupApp:
 
             console_logs = self._set_console_codepage_all(default_cp)
             for level, message in console_logs:
-                if "error" in level:
-                    self._log(message, level)
+                self._log(message, level)
             self._log_separator("恢复系统默认(不含工具)结束")
 
             # 刷新检测与状态
@@ -278,9 +283,19 @@ class SetupApp:
         control_row.pack(fill="x", pady=(1, 0))
         self.start_btn = ttk.Button(control_row, text="开始执行配置", command=self._start_setup)
         self.start_btn.pack(side="left")
-        self.reset_default_btn = ttk.Button(control_row, text="恢复系统默认(不含工具)", command=self._reset_to_system_default)
+        self.reset_default_btn = ttk.Button(
+            control_row,
+            text="恢复系统默认编码(控制台配置)",
+            width=24,
+            command=self._reset_to_system_default,
+        )
         self.reset_default_btn.pack(side="left", padx=(8, 0))
-        self.restore_btn = ttk.Button(control_row, text="恢复配置", command=self._restore_configs)
+        self.restore_btn = ttk.Button(
+            control_row,
+            text="恢复已备份配置",
+            width=20,
+            command=self._restore_configs,
+        )
         self.restore_btn.pack(side="left", padx=(8, 0))
         ttk.Button(control_row, text="退出", command=self.root.destroy).pack(side="right")
         self.backup_btn = ttk.Button(
@@ -370,8 +385,8 @@ class SetupApp:
                 self.tool_info_var.set("已检测到 Visual Studio Code")
             self.vscode_path_var.set(str(settings_path))
         else:
-            self.tool_info_var.set("未检测到 Visual Studio Code，无法定位配置文件")
-            self.vscode_path_var.set("未检测到 Visual Studio Code，执行时将自动写入默认路径")
+            self.tool_info_var.set("未检测到 Visual Studio Code，请在安装后再次执行配置")
+            self.vscode_path_var.set("未检测到 Visual Studio Code，请在安装后再次执行配置")
 
     def _append_console_logs(self, messages: list[tuple[str, str]]) -> None:
         if not messages:
@@ -593,6 +608,17 @@ class SetupApp:
         if not settings_path.exists():
             return {"state": "missing", "summary": "未找到 settings.json"}
 
+        try:
+            raw_text = settings_path.read_text(encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            return {"state": "unreadable", "summary": f"读取失败: {exc}"}
+
+        # 如果未写入过工具标记块，判定为“缺失”而非“漂移”（兼容旧版英文标记）
+        start_hits = any(m in raw_text for m in (VSCODE_MARKER_START, VSCODE_MARKER_START_LEGACY))
+        end_hits = any(m in raw_text for m in (VSCODE_MARKER_END, VSCODE_MARKER_END_LEGACY))
+        if not (start_hits and end_hits):
+            return {"state": "missing", "summary": "未检测到工具标记块"}
+
         data, err = self._load_json_relaxed(settings_path)
         if err or not isinstance(data, dict):
             return {"state": "unreadable", "summary": err or "解析失败"}
@@ -666,7 +692,7 @@ class SetupApp:
             "ps5": getattr(self, "_ps5_available", False),
             "ps7": getattr(self, "_ps7_available", False),
             "git": self._git_exe is not None,
-            "vscode": bool(getattr(self, "_vscode_available", False)) or self._detect_vscode_settings_drift().get("state") != "missing",
+            "vscode": bool(getattr(self, "_vscode_available", False)),
         }
 
         # 先触发一次检测，确保 detail 缓存可用
@@ -820,24 +846,42 @@ class SetupApp:
         cleaned = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", cleaned)  # 清理控制字符（保留 \t\r\n）
         return cleaned
 
-    def _append_vscode_block(self, raw_text: str) -> tuple[str, bool, str | None]:
-        """删除冲突键后在末尾追加统一块；保留原注释和行序。
+    def _append_vscode_block(self, raw_text: str, preserved_custom_lines: list[str] | None = None) -> tuple[str, bool, str | None]:
+        """删除冲突键后在末尾追加统一块；保留原注释和行序，并尽量保留用户在标记块中的自定义键。
 
         返回 (新文本, 是否写入, 错误消息)；错误时不改动原文本。
         """
-        marker_start = "// Code-encoding-fix block (do not remove)"
-        marker_end = "// Code-encoding-fix block end"
+        marker_start = VSCODE_MARKER_START
+        marker_end = VSCODE_MARKER_END
+        marker_start_candidates = (VSCODE_MARKER_START, VSCODE_MARKER_START_LEGACY)
+        marker_end_candidates = (VSCODE_MARKER_END, VSCODE_MARKER_END_LEGACY)
         # 历史版本可能存在文案差异；重复执行时需一并清理，避免残留“仅注释块”
         orphan_comment_lines = {
-            marker_start,
-            marker_end,
+            VSCODE_MARKER_START,
+            VSCODE_MARKER_END,
+            VSCODE_MARKER_START_LEGACY,
+            VSCODE_MARKER_END_LEGACY,
             "// 自动猜测编码以兼容混合文件",
             "// 终端默认使用 PowerShell",
             "// VS Code 终端环境：统一 UTF-8",
             "// Visual Studio Code 终端环境：统一 UTF-8",
         }
+        expected_lines_set = {
+            f'    "files.encoding": "utf8",',
+            f"    // 自动猜测编码以兼容混合文件",
+            f'    "files.autoGuessEncoding": true,',
+            f"    // 终端默认使用 PowerShell",
+            f'    "terminal.integrated.defaultProfile.windows": "PowerShell",',
+            f"    // Visual Studio Code 终端环境：统一 UTF-8",
+            f'    "terminal.integrated.env.windows": {{',
+            f'        "LANG": "zh_CN.UTF-8",',
+            f'        "LC_ALL": "zh_CN.UTF-8"',
+            f"    }}",
+        }
+        preserved_custom_lines = preserved_custom_lines or []
 
         newline = "\r\n" if "\r\n" in raw_text else "\n"
+
         target_keys = [
             '"files.encoding"',
             '"files.autoGuessEncoding"',
@@ -845,17 +889,23 @@ class SetupApp:
         ]
         target_env_key = '"terminal.integrated.env.windows"'
 
-        # 1) 优先移除完整标记块（包含 start/end 行），解决重复块/旧块残留问题
+        # 1) 优先移除完整标记块（包含 start/end 行），解决重复块/旧块残留问题，
+        #    同时保留用户在标记块内额外添加的键/注释，稍后再插回去。
         lines = raw_text.splitlines(keepends=True)
         cleaned_lines: list[str] = []
         i = 0
         while i < len(lines):
             line = lines[i]
-            if marker_start in line:
+            if any(m in line for m in marker_start_candidates):
                 j = i + 1
-                while j < len(lines) and (marker_end not in lines[j]):
+                while j < len(lines) and not any(m in lines[j] for m in marker_end_candidates):
                     j += 1
-                if j < len(lines) and marker_end in lines[j]:
+                if j < len(lines) and any(m in lines[j] for m in marker_end_candidates):
+                    # 收集自定义行（非预期行）以便后续保留（保留原始换行与缩进）
+                    for ln in lines[i + 1 : j]:
+                        stripped = ln.strip()
+                        if stripped and stripped not in expected_lines_set and stripped not in orphan_comment_lines:
+                            preserved_custom_lines.append(ln)
                     # 跳过整个块
                     i = j + 1
                     continue
@@ -905,6 +955,10 @@ class SetupApp:
                 new_lines[j] = new_lines[j].rstrip("\n").rstrip() + ",\n"
             break
 
+        env_lines = [
+            f'        "LANG": "zh_CN.UTF-8",{newline}',
+            f'        "LC_ALL": "zh_CN.UTF-8"{newline}',
+        ]
         block = [
             f"    {marker_start}{newline}",
             f'    "files.encoding": "utf8",{newline}',
@@ -914,16 +968,57 @@ class SetupApp:
             f'    "terminal.integrated.defaultProfile.windows": "PowerShell",{newline}',
             f"    // Visual Studio Code 终端环境：统一 UTF-8{newline}",
             f'    "terminal.integrated.env.windows": {{{newline}',
-            f'        "LANG": "zh_CN.UTF-8",{newline}',
-            f'        "LC_ALL": "zh_CN.UTF-8"{newline}',
+            *env_lines,
             f"    }}{newline}",
             f"    {marker_end}{newline}",
+            *preserved_custom_lines,
         ]
 
         new_lines = new_lines[:insert_pos] + block + new_lines[insert_pos:]
         new_text = "".join(new_lines)
         changed = new_text != raw_text
         return new_text, changed, None
+
+    def _remove_vscode_block(self, raw_text: str) -> tuple[str, bool, str | None]:
+        """移除 VS Code 工具标记块及关联键，确保恢复后文件无残留。"""
+        marker_start_candidates = (VSCODE_MARKER_START, VSCODE_MARKER_START_LEGACY)
+        marker_end_candidates = (VSCODE_MARKER_END, VSCODE_MARKER_END_LEGACY)
+        orphan_comment_lines = {
+            VSCODE_MARKER_START,
+            VSCODE_MARKER_END,
+            VSCODE_MARKER_START_LEGACY,
+            VSCODE_MARKER_END_LEGACY,
+            "// 自动猜测编码以兼容混合文件",
+            "// 终端默认使用 PowerShell",
+            "// VS Code 终端环境：统一 UTF-8",
+            "// Visual Studio Code 终端环境：统一 UTF-8",
+        }
+        lines = raw_text.splitlines(keepends=True)
+        cleaned_lines: list[str] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if any(m in line for m in marker_start_candidates):
+                j = i + 1
+                while j < len(lines) and not any(m in lines[j] for m in marker_end_candidates):
+                    j += 1
+                if j < len(lines) and any(m in lines[j] for m in marker_end_candidates):
+                    i = j + 1
+                    continue
+            cleaned_lines.append(line)
+            i += 1
+
+        new_lines = [ln for ln in cleaned_lines if ln.strip() not in orphan_comment_lines]
+
+        # 如果末尾出现多余逗号，移除以保证 JSON 合法
+        stripped_nonempty = [(idx, ln) for idx, ln in enumerate(new_lines) if ln.strip() and not ln.strip().startswith("//")]
+        if stripped_nonempty:
+            last_idx, last_line = stripped_nonempty[-1]
+            if last_line.strip().endswith(","):
+                new_lines[last_idx] = last_line.rstrip().rstrip(",") + ("\n" if last_line.endswith("\n") else "")
+
+        new_text = "".join(new_lines)
+        return new_text, new_text != raw_text, None
 
     def _load_json_relaxed(self, path: Path) -> tuple[dict | None, str | None]:
         """宽松解析 Visual Studio Code settings.json，失败返回错误信息且不写入。"""
@@ -981,6 +1076,10 @@ class SetupApp:
             if log:
                 self._log("无法定位 APPDATA，跳过 Visual Studio Code 设置", "warning")
             return
+        if apply and not getattr(self, "_vscode_available", False):
+            if log:
+                self._log("未检测到 Visual Studio Code，可执行文件缺失，跳过 UTF-8 设置", "warning")
+            return
         settings_path = Path(appdata) / "Code" / "User" / "settings.json"
         backup_path = self._vscode_backup_path()
         target_dir = settings_path.parent
@@ -989,7 +1088,12 @@ class SetupApp:
         if apply:
             if settings_path.exists() and not backup_path.exists():
                 backup_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(settings_path, backup_path)
+                try:
+                    raw_for_backup = settings_path.read_text(encoding="utf-8")
+                    cleaned_backup, changed_backup, _ = self._remove_vscode_block(raw_for_backup)
+                    backup_path.write_text(cleaned_backup if changed_backup else raw_for_backup, encoding="utf-8")
+                except Exception:
+                    shutil.copy2(settings_path, backup_path)
                 if log:
                     self._log(f"已创建 Visual Studio Code 原始配置备份: {backup_path}", "info")
             raw_text = settings_path.read_text(encoding="utf-8") if settings_path.exists() else "{\n}\n"
@@ -1010,13 +1114,41 @@ class SetupApp:
             if backup_path.exists():
                 shutil.copy2(backup_path, settings_path)
                 backup_path.unlink(missing_ok=True)
-                self._vscode_restore_result = "restored"
-                if log:
-                    self._log("Visual Studio Code 已从原始配置备份恢复", "info")
+                try:
+                    restored_text = settings_path.read_text(encoding="utf-8")
+                    cleaned_text, changed, err = self._remove_vscode_block(restored_text)
+                    if not err and changed:
+                        settings_path.write_text(cleaned_text, encoding="utf-8")
+                        self._vscode_restore_result = "restored-cleaned"
+                        if log:
+                            self._log("Visual Studio Code 已从原始配置备份恢复并清理工具块残留", "info")
+                    else:
+                        self._vscode_restore_result = "restored"
+                        if log:
+                            self._log("Visual Studio Code 已从原始配置备份恢复", "info")
+                except Exception as exc:  # noqa: BLE001
+                    self._vscode_restore_result = "restored"
+                    if log:
+                        self._log(f"Visual Studio Code 已恢复，但清理工具块时出错: {exc}", "warning")
             else:
+                # 无备份时，清理残留工具块与键值，保持当前用户配置
                 self._vscode_restore_result = "no-backup"
-                if log:
-                    self._log("未找到 Visual Studio Code 原始配置备份，跳过恢复", "warning")
+                if settings_path.exists():
+                    try:
+                        text_current = settings_path.read_text(encoding="utf-8")
+                        cleaned_text, changed, err = self._remove_vscode_block(text_current)
+                        if not err and changed:
+                            settings_path.write_text(cleaned_text, encoding="utf-8")
+                            self._vscode_restore_result = "cleaned-no-backup"
+                            if log:
+                                self._log("未找到原始备份，已清理 VS Code 工具块残留", "info")
+                        elif log:
+                            self._log("未找到原始备份，VS Code 配置未改动", "warning")
+                    except Exception as exc:  # noqa: BLE001
+                        if log:
+                            self._log(f"未找到原始备份，清理 VS Code 配置失败: {exc}", "warning")
+                elif log:
+                    self._log("未找到原始备份且当前无配置文件，跳过 VS Code 恢复", "warning")
 
     def _flush_console_logs(self) -> None:
         if not self._console_log_buffer:
@@ -1184,30 +1316,30 @@ class SetupApp:
             key_name = self._console_key_from_path(self._ps5_exe)
             values = self._read_console_values(key_name)
             if values and values.get("CodePage") == 65001:
-                statuses.append(f"{label("Windows PowerShell 5.1")}=UTF-8")
+                statuses.append(f"{label('Windows PowerShell 5.1')}=UTF-8")
             elif values and values.get("CodePage"):
                 cp = values.get("CodePage")
                 prefix = "UTF-8" if cp == 65001 else f"{cp}"
-                statuses.append(f"{label("Windows PowerShell 5.1")}={prefix}")
+                statuses.append(f"{label('Windows PowerShell 5.1')}={prefix}")
             else:
-                statuses.append(f"{label("Windows PowerShell 5.1")}=未配置UTF-8")
+                statuses.append(f"{label('Windows PowerShell 5.1')}=未配置UTF-8")
         else:
-            statuses.append(f"{label("Windows PowerShell 5.1")}=未检测到")
+            statuses.append(f"{label('Windows PowerShell 5.1')}=未检测到")
 
         # PowerShell 7+
         if self._ps7_available and self._ps7_exe:
             key_name = self._console_key_from_path(self._ps7_exe)
             values = self._read_console_values(key_name)
             if values and values.get("CodePage") == 65001:
-                statuses.append(f"{label("PowerShell 7+")}=UTF-8")
+                statuses.append(f"{label('PowerShell 7+')}=UTF-8")
             elif values and values.get("CodePage"):
                 cp = values.get("CodePage")
                 prefix = "UTF-8" if cp == 65001 else f"{cp}"
-                statuses.append(f"{label("PowerShell 7+")}={prefix}")
+                statuses.append(f"{label('PowerShell 7+')}={prefix}")
             else:
-                statuses.append(f"{label("PowerShell 7+")}=未配置UTF-8")
+                statuses.append(f"{label('PowerShell 7+')}=未配置UTF-8")
         else:
-            statuses.append(f"{label("PowerShell 7+")}=未安装")
+            statuses.append(f"{label('PowerShell 7+')}=未安装")
 
         # Windows Terminal
         wt_path = self._find_windows_terminal()
@@ -1215,26 +1347,26 @@ class SetupApp:
             key_name = self._console_key_from_path(wt_path)
             values = self._read_console_values(key_name)
             if values and values.get("CodePage") == 65001:
-                statuses.append(f"{label("Windows Terminal")}=UTF-8")
+                statuses.append(f"{label('Windows Terminal')}=UTF-8")
             elif values and values.get("CodePage"):
                 cp = values.get("CodePage")
                 prefix = "UTF-8" if cp == 65001 else f"{cp}"
-                statuses.append(f"{label("Windows Terminal")}={prefix}")
+                statuses.append(f"{label('Windows Terminal')}={prefix}")
             else:
-                statuses.append(f"{label("Windows Terminal")}=未配置UTF-8")
+                statuses.append(f"{label('Windows Terminal')}=未配置UTF-8")
         else:
-            statuses.append(f"{label("Windows Terminal")}=未检测到")
+            statuses.append(f"{label('Windows Terminal')}=未检测到")
 
         # CMD 状态单独追加
         cmd_cp, cmd_available = self._detect_cmd_codepage()
         if not cmd_available:
-            statuses.append(f"{label("CMD")}=未检测到")
+            statuses.append(f"{label('CMD')}=未检测到")
         elif cmd_cp == 65001:
-            statuses.append(f"{label("CMD")}=65001")
+            statuses.append(f"{label('CMD')}=65001")
         elif cmd_cp:
-            statuses.append(f"{label("CMD")}={cmd_cp}")
+            statuses.append(f"{label('CMD')}={cmd_cp}")
         else:
-            statuses.append(f"{label("CMD")}=未配置UTF-8")
+            statuses.append(f"{label('CMD')}=未配置UTF-8")
 
         sep = " " if short else "；"
         return sep.join(statuses)
@@ -1554,13 +1686,9 @@ class SetupApp:
         else:
             self._ps5_available = False
             self._ps5_exe = None
-            self.ps5_path_var.set("")
-            self._set_row_state(
-                "ps5",
-                False,
-                "未检测到 Windows PowerShell 5.1，无法定位配置文件",
-                "",
-            )
+            missing_msg = "未检测到 Windows PowerShell 5.1，请在安装后再次执行配置"
+            self.ps5_path_var.set(missing_msg)
+            self._set_row_state("ps5", False, missing_msg, missing_msg, placeholder=True)
             if log:
                 self._log("未检测到 Windows PowerShell 5.1", "warning")
 
@@ -1607,13 +1735,9 @@ class SetupApp:
         else:
             self._ps7_available = False
             self._ps7_exe = None
-            self.ps7_path_var.set("")
-            self._set_row_state(
-                "ps7",
-                False,
-                "未检测到 PowerShell 7+，无法定位配置文件",
-                "",
-            )
+            missing_msg = "未检测到 PowerShell 7+，请在安装后再次执行配置"
+            self.ps7_path_var.set(missing_msg)
+            self._set_row_state("ps7", False, missing_msg, missing_msg, placeholder=True)
             if log:
                 self._log("未检测到 PowerShell 7+", "warning")
 
@@ -2030,14 +2154,10 @@ class SetupApp:
             if log:
                 self._log(f"检测到 Git Bash: {found}", "success")
         else:
+            missing_msg = "未检测到 Git Bash，请安装 Git for Windows 后再次执行配置"
             self._git_exe = None
-            self.git_path_var.set("")
-            self._set_row_state(
-                "git",
-                False,
-                "未检测到 Git Bash，无法定位配置文件",
-                "",
-            )
+            self.git_path_var.set(missing_msg)
+            self._set_row_state("git", False, missing_msg, missing_msg, placeholder=True)
             if log:
                 self._log("未找到 Git Bash，无法配置 UTF-8，请先安装 Git for Windows", "warning")
 
@@ -2067,7 +2187,6 @@ class SetupApp:
                 if c and c.exists():
                     exe_resolved = c.resolve()
                     break
-        self._vscode_available = bool(exe_resolved)
         display_exe = None
         if exe_resolved:
             if exe_resolved.name.lower() == "code.cmd":
@@ -2079,36 +2198,33 @@ class SetupApp:
             else:
                 display_exe = exe_resolved
 
-        if display_exe:
-            self.tool_info_var.set(f"已检测到 Visual Studio Code: {display_exe}")
+        missing_msg = "未检测到 Visual Studio Code，请在安装后再次执行配置"
+        detected_status = f"已检测到 Visual Studio Code: {display_exe}" if display_exe else "已检测到 Visual Studio Code"
+        self._vscode_available = bool(exe_resolved)
+
+        if self._vscode_available:
+            self.tool_info_var.set(detected_status)
         else:
-            self.tool_info_var.set("未检测到 Visual Studio Code，无法定位配置文件")
+            self.tool_info_var.set(missing_msg)
 
         if settings_path:
             settings_exists = settings_path.exists()
-            path_text = str(settings_path) if settings_exists else "未检测到 settings.json，执行时将自动写入默认路径"
-            self.vscode_path_var.set(path_text if settings_exists else str(settings_path))
-            status = (
-                f"已检测到 Visual Studio Code: {display_exe}"
-                if display_exe
-                else "未检测到 Visual Studio Code，无法定位配置文件"
-            )
-            self._set_row_state(
-                "vscode",
-                settings_exists or bool(exe_resolved),
-                status,
-                path_text,
-                placeholder=not settings_exists,
-            )
+            path_text = str(settings_path) if settings_exists else "未检测到 settings.json，将在执行时创建"
+            if self._vscode_available:
+                self.vscode_path_var.set(str(settings_path))
+                self._set_row_state(
+                    "vscode",
+                    True,
+                    detected_status,
+                    path_text,
+                    placeholder=not settings_exists,
+                )
+            else:
+                self.vscode_path_var.set(missing_msg)
+                self._set_row_state("vscode", False, missing_msg, missing_msg, placeholder=True)
         else:
-            self.vscode_path_var.set("未检测到 Visual Studio Code，执行时将自动写入默认路径")
-            self._set_row_state(
-                "vscode",
-                False,
-                "未检测到 Visual Studio Code，无法定位配置文件",
-                "",
-                placeholder=True,
-            )
+            self.vscode_path_var.set(missing_msg)
+            self._set_row_state("vscode", False, missing_msg, missing_msg, placeholder=True)
 
         if log:
             if display_exe:
@@ -2207,13 +2323,19 @@ class SetupApp:
             self.start_btn.config(state="disabled")
             return
         status = self._detect_shell_config_status()
+        detail = getattr(self, "_tool_config_detail", {})
         availability = {
             "ps5": getattr(self, "_ps5_available", False),
             "ps7": getattr(self, "_ps7_available", False),
             "git": self._git_exe is not None,
-            "vscode": bool(getattr(self, "_vscode_available", False)) or self._detect_vscode_settings_drift().get("state") != "missing",
+            "vscode": bool(getattr(self, "_vscode_available", False)),
         }
         considered = {k: v for k, v in status.items() if availability.get(k)}
+        # 若任一可用项处于不可读取状态，禁止执行以避免再次污染
+        for k, v in detail.items():
+            if availability.get(k) and isinstance(v, dict) and str(v.get("state")) == "unreadable":
+                self.start_btn.config(state="disabled")
+                return
         all_configured = considered and all(considered.values())
         # 仅当可用的 shell 均已配置且控制台 CodePage 为 UTF-8 时禁用
         if all_configured and self._all_consoles_utf8():
@@ -2239,14 +2361,14 @@ class SetupApp:
         ops.append(lambda: self._verify_bash(bash_path))
 
         # 2) 配置 Windows PowerShell 5.1
-        if self.ps5_path_var.get():
+        if self._ps5_available and self.ps5_path_var.get():
             ps5_profile = Path.home() / "Documents" / "WindowsPowerShell" / "Microsoft.PowerShell_profile.ps1"
             ops.append(lambda: self._configure_powershell_profile(ps5_profile, bash_path, "Windows PowerShell 5.1"))
         else:
             ops.append(lambda: self._log("Windows PowerShell 5.1: 未安装，跳过执行", "warning"))
 
         # 3) 配置 PowerShell 7+
-        if self.ps7_path_var.get():
+        if self._ps7_available and self.ps7_path_var.get():
             ps7_profile = Path.home() / "Documents" / "PowerShell" / "Microsoft.PowerShell_profile.ps1"
             ops.append(lambda: self._configure_powershell_profile(ps7_profile, bash_path, "PowerShell 7+"))
         else:
@@ -2256,7 +2378,10 @@ class SetupApp:
         ops.append(lambda: self._configure_bashrc_user(bash_path))
 
         # 5) 配置 Visual Studio Code
-        ops.append(lambda: self._apply_vscode_settings(apply=True, log=True))
+        if getattr(self, "_vscode_available", False):
+            ops.append(lambda: self._apply_vscode_settings(apply=True, log=True))
+        else:
+            ops.append(lambda: self._log("Visual Studio Code: 未检测到，跳过配置", "warning"))
 
         # 6) 控制台编码
         def _console_utf8() -> None:
@@ -2621,7 +2746,7 @@ class SetupApp:
             "ps5": getattr(self, "_ps5_available", False),
             "ps7": getattr(self, "_ps7_available", False),
             "git": self._git_exe is not None,
-            "vscode": bool(getattr(self, "_vscode_available", False)) or self._detect_vscode_settings_drift().get("state") != "missing",
+            "vscode": bool(getattr(self, "_vscode_available", False)),
         }
         considered = {k: v for k, v in status.items() if availability.get(k)}
 
@@ -2698,8 +2823,8 @@ class SetupApp:
         self._restore_start_logged = True
         self._set_buttons_state(False)
         confirm = self._show_modal(
-            "恢复配置",
-            "将 工具配置、控制台编码和shell语言环境 恢复到首次执行时的状态，会覆盖之后的手动修改。\n\n是否继续？",
+            "恢复已备份配置",
+            "将 工具配置、控制台编码和 shell 语言环境 恢复到首次执行时的状态，会覆盖之后的手动修改。\n\n是否继续？",
             kind="confirm",
             confirm_text="继续",
             cancel_text="取消",
@@ -2782,13 +2907,18 @@ class SetupApp:
 
             self._progress_advance(1)
             self._apply_vscode_settings(apply=False, log=False)
-            vscode_log = (
-            ("success", "Visual Studio Code 已从原始配置备份恢复")
-                if getattr(self, "_vscode_restore_result", "") == "restored"
-            else ("warning", "Visual Studio Code 未找到原始备份，未改动当前配置文件")
-                if getattr(self, "_vscode_restore_result", "") == "no-backup"
-            else ("warning", "Visual Studio Code: 未安装，跳过恢复") if not getattr(self, "_vscode_available", False) else ("info", "Visual Studio Code: 已检测到，可手动检查 settings.json")
-            )
+            vscode_result = getattr(self, "_vscode_restore_result", "")
+            if vscode_result in ("restored", "restored-cleaned"):
+                msg = "Visual Studio Code 已从原始配置备份恢复"
+                if vscode_result == "restored-cleaned":
+                    msg += "（已清理工具块残留）"
+                vscode_log = ("success", msg)
+            elif vscode_result == "cleaned-no-backup":
+                vscode_log = ("warning", "Visual Studio Code 未找到原始备份，已清理当前配置中的工具块残留")
+            elif vscode_result == "no-backup":
+                vscode_log = ("warning", "Visual Studio Code 未找到原始备份，未改动当前配置文件")
+            else:
+                vscode_log = ("warning", "Visual Studio Code: 未安装，跳过恢复") if not getattr(self, "_vscode_available", False) else ("info", "Visual Studio Code: 已检测到，可手动检查 settings.json")
             tool_logs.append(vscode_log)
             self._progress_advance(1)
 
@@ -2841,9 +2971,13 @@ class SetupApp:
             tool_lines.append("• PowerShell 7+: 已从原始配置备份恢复" if getattr(self, "_ps7_available", False) else "• PowerShell 7+: 未安装，跳过恢复")
             tool_lines.append("• Git Bash: 已从原始配置备份恢复" if self._git_exe else "• Git Bash: 未安装，跳过恢复")
             if getattr(self, "_vscode_available", False):
-                if getattr(self, "_vscode_restore_result", "") == "restored":
-                    tool_lines.append("• Visual Studio Code: 已从原始配置备份恢复")
-                elif getattr(self, "_vscode_restore_result", "") == "no-backup":
+                vr = getattr(self, "_vscode_restore_result", "")
+                if vr in ("restored", "restored-cleaned"):
+                    suffix = "，已清理工具块残留" if vr == "restored-cleaned" else ""
+                    tool_lines.append(f"• Visual Studio Code: 已从原始配置备份恢复{suffix}")
+                elif vr == "cleaned-no-backup":
+                    tool_lines.append("• Visual Studio Code: 未找到原始配置备份，已清理当前配置中的工具块残留")
+                elif vr == "no-backup":
                     tool_lines.append("• Visual Studio Code: 未找到原始配置备份，未改动当前配置文件")
                 else:
                     tool_lines.append("• Visual Studio Code: 已检测到，可手动检查 settings.json")
