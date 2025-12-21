@@ -20,6 +20,12 @@
 
 ---
 
+## 🖼️ Screenshot
+
+<div align="center">
+  <img src="screenshot.png" width="820" alt="Code-encoding-fix GUI screenshot" />
+</div>
+
 ## 🎯 Why Code-encoding-fix?
 
 **The Problem:** Windows terminals default to legacy code pages (e.g., CP936 for Chinese), causing Chinese characters to display as garbled text (乱码) when using Codex CLI, Claude Code, or other modern development tools.

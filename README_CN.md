@@ -20,6 +20,12 @@
 
 ---
 
+## 🖼️ 截图
+
+<div align="center">
+  <img src="screenshot.png" width="820" alt="Code-encoding-fix 编码配置助手界面截图" />
+</div>
+
 ## 🎯 为什么需要 Code-encoding-fix？
 
 **问题所在：** Windows 终端默认使用传统代码页（如中文系统的 CP936），导致在使用 Codex CLI、Claude Code 等现代开发工具时，中文字符显示为乱码。
